@@ -1,0 +1,16 @@
+# 忽略大型权重文件
+*.pth
+*.onnx
+*.ckpt
+*.h5
+
+# 忽略数据集文件夹
+data/
+datasets/
+hellaswag/
+edu_fineweb10B/
+
+# 忽略 Python 缓存和日志
+__pycache__/
+logs/
+.ipynb_checkpoints/

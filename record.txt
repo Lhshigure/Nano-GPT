@@ -1,0 +1,27 @@
+Original Nano-GPT2
+
+1epoch
+Min Train Loss: 2.922038
+Min Validation Loss: 3.0726
+Max Hellaswag eval: 0.3068
+4poch
+Min Train Loss: 2.69337
+Min Validation Loss: 2.9478
+Max Hellaswag eval: 0.337
+
+
+Open-ai hella_baseline
+GPT2
+"124M": 0.294463
+"350M": 0.375225
+"774M": 0.431986
+GPT3
+"124M":0.337
+"350M":0.436
+"774M":0.510
+"1558M":0.547
+
+Open-ai val_loss_baseline
+GPT2
+"124M":3.2924
+
