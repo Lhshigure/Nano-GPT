@@ -3,6 +3,8 @@
 *.onnx
 *.ckpt
 *.h5
+*.pt
+model_*.pt
 
 # 忽略数据集文件夹
 data/
@@ -10,10 +12,11 @@ datasets/
 hellaswag/
 edu_fineweb10B/
 
+
 # 忽略 Python 缓存和日志
 __pycache__/
+*.pyc
 logs/
 .ipynb_checkpoints/
 .autodl/autopanel.monitor.db
-
 .autodl/autopanel.monitor.db

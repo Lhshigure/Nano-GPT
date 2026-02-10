@@ -83,25 +83,34 @@ class Muon(Optimizer):
                 if group['weight_decay'] != 0:
                     p.mul_(1.0 - group['lr'] * group['weight_decay'])
 
-                # 2. 动量更新
+                # ------------------- 核心修改开始 -------------------
+                # 2. 动量更新 (强制使用 FP32)
                 if 'momentum_buffer' not in state:
-                    state['momentum_buffer'] = torch.zeros_like(g)
+                    # [修改点 1] 初始化 buffer 时指定 dtype=torch.float32
+                    state['momentum_buffer'] = torch.zeros_like(g, dtype=torch.float32)
                 
-                buf = state['momentum_buffer']
-                buf.mul_(group['momentum']).add_(g)
+                buf = state['momentum_buffer'] # 这是一个 fp32 tensor
+                
+                # [修改点 2] 将当前梯度临时转为 fp32 参与计算
+                g_fp32 = g.to(torch.float32)
 
-                # Nesterov 动量处理
+                # 在 fp32 精度下进行动量累积：buf = momentum * buf + g
+                buf.mul_(group['momentum']).add_(g_fp32)
+
+                # Nesterov 动量处理 (全在 fp32 下计算)
                 if group['nesterov']:
-                    g_eff = g.add(buf, alpha=group['momentum'])
+                    g_eff = g_fp32.add(buf, alpha=group['momentum'])
                 else:
                     g_eff = buf
 
                 # 3. Newton-Schulz 正交化
-                # 寻找更新的“方向”，丢弃其原始幅值
+                # 注意：_newton_schulz_orthogonalize 内部通常也需要 fp32 计算
+                # 由于传入的 g_eff 已经是 fp32，这里直接传进去即可
                 update = _newton_schulz_orthogonalize(g_eff, steps=group['ns_steps'])
 
                 # 4. 参数更新
-                # 注意：Muon 更新通常配合比 AdamW 更大的学习率
-                p.add_(update, alpha=-group['lr'])
+                # [修改点 3] 将计算好的 fp32 update 转回参数原始类型 (如 bf16) 再更新
+                p.add_(update.to(p.dtype), alpha=-group['lr'])
+                # ------------------- 核心修改结束 -------------------
 
         return loss

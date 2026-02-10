@@ -19,16 +19,14 @@ def render_example(example, tokenizer):
     endings = example["endings"]
     label = example["label"] 
     
-    # 3. 使用 SmolLM 分词器编码背景部分
-    # add_special_tokens=False 防止在每个选项前都加 BOS
-    ctx_tokens = tokenizer.encode(ctx, add_special_tokens=False)
+  
+    ctx_tokens = tokenizer.encode(ctx)
     toks = []
     mask = []
     
     for end in endings:
-        # 4. 在选项前加个空格（SmolLM/Llama 风格的分词器对空格敏感）
         # 编码选项部分
-        end_tokens = tokenizer.encode(" " + end, add_special_tokens=False)
+        end_tokens = tokenizer.encode(" " + end)
         
         full_tokens = ctx_tokens + end_tokens
         toks.append(torch.tensor(full_tokens))

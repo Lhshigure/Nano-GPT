@@ -5,6 +5,8 @@ from Nanogpt_modified import GPT, GPTConfig
 from utilities import iterate_examples, render_example, get_most_likely_row
 import warnings
 import tiktoken
+from torch.utils.tensorboard import SummaryWriter
+import shutil
 
 warnings.filterwarnings("ignore", category=FutureWarning)
 
@@ -85,7 +87,7 @@ class DataLoaderLite:
 # simple run:
 # python train_gpt2.py
 # DDP run:
-# torchrun --standalone --nproc_per_node=8 train_gpt2.py
+# torchrun --standalone --nproc_per_node=4 train.py
 
 import time
 import os
@@ -177,10 +179,13 @@ max_lr = 6e-4
 min_lr = max_lr * 0.1
 warmup_steps = 712
 max_steps = 19073
+max_lr_muon = 0.02   #Muon max lr
+
 
 #----------------------------------------------------------------
 # wsd + cosine
-def get_lr_wsd_cosine(it, decay_start_pct=0.8):
+def get_lr_wsd_cosine(it, decay_start_pct=0.6):
+    
     # 1. Warmup
     if it < warmup_steps:
         return max_lr * (it + 1) / warmup_steps
@@ -211,57 +216,83 @@ def get_lr_cos(it):
 
 # optimizer
 # optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, betas=(0.9, 0.95), eps = 1e-8)
-optimizers = raw_model.configure_optimizers(learning_rate=6e-4, device=device)
+optimizers = raw_model.configure_optimizers(learning_rate=max_lr, device=device)
 opt_muon, opt_adamw = optimizers
 
 #-------------记录训练数据-----------------------------
-# --- 新增：断点续训加载逻辑 ---
+# --- 新增断点续训加载逻辑 ---
 import csv
-log_dir = "log"  # save file
-start_step = 0
-os.makedirs(log_dir, exist_ok=True)
-checkpoint_path = os.path.join(log_dir, "model_latest.pt")
-#保存最佳loss model
-best_val_loss = float('inf')
+import glob
+import re
 
-if os.path.exists(checkpoint_path):
+# --- 修改后的断点续训加载逻辑 ---
+log_dir = "log"
+start_step = 0
+best_val_loss = float('inf')
+os.makedirs(log_dir, exist_ok=True)
+# 1. 自动寻找最新的 Checkpoint 文件,搜索目录下所有 model_ 开头的 .pt 文件
+checkpoint_files = glob.glob(os.path.join(log_dir, "model_*.pt"))
+
+if checkpoint_files:
+    # 过滤掉 'latest'，根据文件名中的数字找到最大的那个
+    # 比如从 ['model_0002000.pt', 'model_0004000.pt'] 中选出 4000
+    try:
+        # 先尝试找 model_latest.pt，如果不存在则通过正则匹配步数最大的文件
+        checkpoint_path = os.path.join(log_dir, "model_latest.pt")
+        if not os.path.exists(checkpoint_path):
+            checkpoint_path = max(checkpoint_files, key=lambda x: int(re.findall(r'\d+', x)[-1]) if re.findall(r'\d+', x) else -1)
+        
+        if master_process:
+            print(f"🔍 发现存档，正在从 {checkpoint_path} 恢复训练...")
+
+        # 2. 加载到正确设备
+        checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
+        
+        # 3. 恢复权重
+        state_dict = checkpoint["model"]
+        raw_model.load_state_dict(state_dict, strict=False)
+        
+        # 4. 恢复两个优化器的状态
+        # 确保此处 opt_muon 和 opt_adamw 已经初始化完毕
+        opt_muon.load_state_dict(checkpoint['optimizer_muon'])
+        opt_adamw.load_state_dict(checkpoint['optimizer_adamw'])
+        
+        # 5. 更新起始步数（从存档的下一步开始）
+        start_step = checkpoint['step'] + 1
+        
+        # 6. 恢复最佳验证损失
+        if 'val_loss' in checkpoint and checkpoint['val_loss'] is not None:
+            best_val_loss = checkpoint['val_loss']
+        
+        if master_process:
+            print(f"✅ 断点恢复成功！将从 Step {start_step} 继续训练。")
+            
+    except Exception as e:
+        if master_process:
+            print(f"⚠️ 尝试恢复存档时出错: {e}，将从零开始训练。")
+else:
     if master_process:
-        print(f"正在从 {checkpoint_path} 恢复训练...")
-    
-    # 1. 加载到正确设备 
-    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
-    
-    # 2. 获取状态字典
-    state_dict = checkpoint["model"]
-    
-    # 3. 恢复权重
-    raw_model.load_state_dict(state_dict, strict=False)
-    
-    # 4. 恢复两个优化器的状态
-    # 确保在 resume 之前已经初始化好了 opt_muon 和 opt_adamw
-    opt_muon.load_state_dict(checkpoint['optimizer_muon'])
-    opt_adamw.load_state_dict(checkpoint['optimizer_adamw'])
-    
-    # 5. 更新起始步数
-    start_step = checkpoint['step'] + 1
-    
-    # 6. 恢复最佳验证损失
-    # 增加 val_loss 存在的判断，防止旧 checkpoint 格式报错
-    if 'val_loss' in checkpoint and checkpoint['val_loss'] is not None:
-        best_val_loss = checkpoint['val_loss']
-    
-    if master_process:
-        print(f"✅ 断点恢复成功！KV-Cache 已重置为全零，将从 Step {start_step} 继续训练。")
+        print("🆕 未发现现有存档，将从 Step 0 开始新训练。")
     
 
 csv_log_path = os.path.join(log_dir, "training_stats.csv")
 if master_process:
+    
+    # 只有当这是从头开始训练 (start_step == 0) 时，才清空旧日志
+    if start_step == 0 and os.path.exists(log_dir):
+        print(f"⚠️ 检测到从头训练，正在清空旧日志文件夹: {log_dir}")
+        shutil.rmtree(log_dir)  # 删文件夹
+    
+    # log_dir="log" 会把日志文件存在 log 文件夹里
+    tb_writer = SummaryWriter(log_dir=log_dir) 
+    print("🚀 TensorBoard logging started...")
+
 
     if start_step == 0:
         with open(csv_log_path, "w", newline="") as f:
-            writer = csv.writer(f)
+            csv_writer = csv.writer(f)
             # 核心指标：步骤、两种Loss、两种学习率、梯度范数、吞吐量、评测准确率
-            writer.writerow([
+            csv_writer.writerow([
                 "step", "train_loss", "val_loss", "val_ppl", 
                 "lr_adamw", "lr_muon", "norm", "dt_ms", 
                 "tokens_per_sec", "hella_acc"
@@ -297,7 +328,7 @@ for step in range(start_step, max_steps):
     
     # -----------------------------------------------------------------------------
     # HellaSwag 评估逻辑
-    if ((step > 0 and step % 500 == 0) or last_step) and (not use_compile):
+    if ((step % 500 == 0) or last_step):
         num_correct_norm = 0
         num_total = 0
         
@@ -356,7 +387,6 @@ for step in range(start_step, max_steps):
     # training loop
     model.train()
     # 对两个优化器都要清零
-    max_lr_muon = 0.02   #Muon 峰值学习率
     for opt in optimizers:
         opt.zero_grad(set_to_none=True) 
 
@@ -406,8 +436,8 @@ for step in range(start_step, max_steps):
     if master_process:
         print(f"step {step} | loss:{loss_accum.item()} | lr:{lr:.6f} | norm:{norm:.4f} | dt:{dt*1000:2f}ms | tokens/sec:{tokens_per_sec}")
 
-        # 保存间隔
-        if step > 0 and (step % 1000 == 0 or last_step):
+        # 保存间隔-
+        if step > 0 and (step % 3000 == 0 or last_step):
             if master_process:
                 # 构造 Checkpoint 字典
                 checkpoint = {
@@ -419,24 +449,45 @@ for step in range(start_step, max_steps):
                     'optimizer_adamw': opt_adamw.state_dict(),
                 }
                 
-                # 1. 始终保存为 latest，用于下次断点续训（自动覆盖旧的 latest）
+                # 1. 保存编号版本（用于保留历史记录，不覆盖）
+                # 使用 :07d 格式化步数，方便文件名按顺序排列（如 model_0003000.pt）
+                step_path = os.path.join(log_dir, f"model_{step:07d}.pt")
+                torch.save(checkpoint, step_path)
+                
+                # 2. 同时更新一份 latest 副本（方便加载逻辑直接定位）
                 latest_path = os.path.join(log_dir, "model_latest.pt")
                 torch.save(checkpoint, latest_path)
-                print(f"💾 已更新最新进度至 {latest_path}")
+                
+                print(f"💾 已保存 Checkpoint：{step_path} 及其最新副本")
 
         
         # 准备本步要记录的数据
         # 准备评估数据：只有在特定步数才填入数值，否则留空 ""
         is_val_step = (step % 250 == 0 or last_step)
-        is_hella_step = ((step > 0 and step % 500 == 0) or last_step)
-        
+        is_hella_step = ((step % 500 == 0) or last_step)
+
+        # ---插入 TensorBoard 记录逻辑 ---
+        tb_writer.add_scalar("Train/Loss", loss_accum.item(), step)
+        tb_writer.add_scalar("Train/LR", lr, step)
+        tb_writer.add_scalar("Train/Norm", norm.item(), step)
+        tb_writer.add_scalar("Train/DT", dt * 1000, step)     
+        tb_writer.add_scalar("Train/TokensPerSec", tokens_per_sec, step)
+
+        # 验证集 Loss 
+        if is_val_step:
+            tb_writer.add_scalar("Val/Loss", val_loss_accum.item(), step)
+            tb_writer.add_scalar("Val/PPL", math.exp(val_loss_accum.item()), step)
+        # 记录 HellaSwag
+        if is_hella_step and 'acc_norm' in locals():
+            tb_writer.add_scalar("Eval/HellaSwag", acc_norm, step)
+
         v_loss = val_loss_accum.item() if is_val_step else ""
         v_ppl = math.exp(val_loss_accum.item()) if is_val_step else ""
         h_acc = acc_norm if (is_hella_step and 'acc_norm' in locals()) else ""
 
         with open(csv_log_path, "a", newline="") as f:
-            writer = csv.writer(f)
-            writer.writerow([
+            csv_writer = csv.writer(f)
+            csv_writer.writerow([
                 step, 
                 loss_accum.item(), 
                 v_loss, 
@@ -449,5 +500,9 @@ for step in range(start_step, max_steps):
                 h_acc            
             ])
 
+if master_process:
+    tb_writer.close()
+
 if ddp:
     destroy_process_group()
+    
