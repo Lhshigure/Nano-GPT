@@ -25,3 +25,11 @@ Open-ai val_loss_baseline
 GPT2
 "124M":3.2924
 
+Modern Nano GPT
+wsd+cosine
+3.1505
+29.56
+
+cosine
+3.1290
+29.52
